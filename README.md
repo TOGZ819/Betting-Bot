@@ -43,7 +43,7 @@ cp .env.example .env
 # DISCORD_TOKEN=your_actual_token_here
 
 # Run the bot
-python sports_betting_bot.py
+python bot.py
 ```
 
 ## Commands
