@@ -36,9 +36,6 @@ A Discord bot for betting on sports with fictional money. Everything you need fo
 # Install dependencies
 pip install -r requirements.txt
 
-# Copy the example .env file
-cp .env.example .env
-
 # Edit .env and add your bot token:
 # DISCORD_TOKEN=your_actual_token_here
 
