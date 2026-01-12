@@ -66,6 +66,204 @@ class BettingSystem:
 
 betting = BettingSystem()
 
+async def finalize_game(game_id: str, winner: str):
+    """Finalize game, pay out winners, and clean up data"""
+    if game_id not in betting.games:
+        return
+    game = betting.games[game_id]
+    if game.get('result'):
+        return
+    if winner not in ['home', 'away']:
+        return
+
+    game['result'] = winner
+    game['locked'] = True
+
+    payouts = []
+    for bet in betting.bets.get(game_id, []):
+        user_id = bet['user_id']
+        used_items = bet.get('used_items', [])
+        if bet['team'] == winner:
+            payout = int(bet.get('potential_win', 0))
+            if payout > 0:
+                betting.update_balance(user_id, payout)
+            betting.users[user_id]['wins'] += 1
+            payouts.append((user_id, payout, True, used_items))
+        else:
+            betting.users[user_id]['losses'] += 1
+            if 'insurance' in used_items:
+                refund = int(bet['amount'] * 0.5)
+                if refund > 0:
+                    betting.update_balance(user_id, refund)
+                payouts.append((user_id, refund, False, ['insurance']))
+            elif '2x_multiplier' in used_items:
+                current_balance = betting.users[user_id]['balance']
+                penalty = min(bet['amount'], current_balance)
+                if penalty > 0:
+                    betting.update_balance(user_id, -penalty)
+                    payouts.append((user_id, -penalty, False, ['2x_penalty']))
+                else:
+                    payouts.append((user_id, 0, False, ['2x_nofunds']))
+            else:
+                payouts.append((user_id, 0, False, []))
+
+    betting.save_data()
+
+    channel = bot.get_channel(game['channel_id'])
+    if not channel:
+        return
+
+    winner_team = game['home_team'] if winner == 'home' else game['away_team']
+    
+    winners_text = ""
+    losers_text = ""
+    for user_id, payout, won, items in payouts:
+        try:
+            user = await bot.fetch_user(int(user_id))
+            name = user.name
+        except:
+            name = user_id
+        if won:
+            bonus = " 💎" if '2x_multiplier' in items else ""
+            winners_text += f"✅ {name}: +${payout:,.0f}{bonus}\n"
+        else:
+            if '2x_penalty' in items:
+                losers_text += f"❌ {name}: -${abs(payout):,.0f} 💥\n"
+            elif 'insurance' in items:
+                losers_text += f"❌ {name}: +${payout:,.0f} 🛡️\n"
+            else:
+                losers_text += f"❌ {name}\n"
+    
+    # Try to edit original message
+    message_id = game.get('message_id')
+    if message_id:
+        try:
+            msg = await channel.fetch_message(int(message_id))
+            
+            sport = game.get('sport', 'NFL')
+            emoji = "🏈" if sport == "NFL" else "🏟️"
+            home_odds = game['home_odds']
+            away_odds = game['away_odds']
+            
+            embed = discord.Embed(
+                title=f"{emoji} {game['home_team']} vs {game['away_team']}",
+                description=f"**🏁 FINAL** • Winner: **{winner_team}**",
+                color=0x2ecc71
+            )
+            
+            embed.add_field(
+                name="━━━━━━━━━━━━━━━━━━━━━━━",
+                value="\u200b",
+                inline=False
+            )
+            
+            # Show winner in green, loser in red
+            if winner == 'home':
+                home_syntax = "diff\n+"
+                away_syntax = "diff\n-"
+            else:
+                home_syntax = "diff\n-"
+                away_syntax = "diff\n+"
+            
+            embed.add_field(
+                name=f"{game['home_team']}",
+                value=f"```{home_syntax}{home_odds:+.0f}```",
+                inline=True
+            )
+            embed.add_field(
+                name="\u200b",
+                value="**VS**",
+                inline=True
+            )
+            embed.add_field(
+                name=f"{game['away_team']}",
+                value=f"```{away_syntax}{away_odds:+.0f}```",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="━━━━━━━━━━━━━━━━━━━━━━━",
+                value="\u200b",
+                inline=False
+            )
+            
+            if winners_text:
+                embed.add_field(name="🎉 Winners", value=winners_text, inline=False)
+            if losers_text:
+                embed.add_field(name="😢 Losers", value=losers_text, inline=False)
+            
+            embed.set_footer(text=f"Game ID: {game_id} • FINAL")
+            
+            await msg.edit(embed=embed, view=None)
+        except Exception as e:
+            print(f"Could not edit message: {e}")
+            # Fallback: post new message
+            embed = discord.Embed(title="🏁 Final", color=0x2ecc71)
+            embed.add_field(name="Game", value=f"{game['home_team']} vs {game['away_team']}", inline=False)
+            embed.add_field(name="Winner", value=winner_team, inline=False)
+            
+            if winners_text:
+                embed.add_field(name="Winners", value=winners_text, inline=True)
+            if losers_text:
+                embed.add_field(name="Losers", value=losers_text, inline=True)
+            
+            await channel.send(embed=embed)
+    
+    # Clean up finished game from data
+    del betting.games[game_id]
+    del betting.bets[game_id]
+    betting.save_data()
+    print(f"Cleaned up finished game: {game_id}")
+
+@tasks.loop(minutes=2)
+async def check_game_results():
+    """Check ESPN for finished games and auto-finalize them"""
+    pending = [(gid, g) for gid, g in betting.games.items() if not g.get('result') and g.get('espn_id') and g.get('league')]
+    if not pending:
+        return
+
+    leagues = set(g['league'] for _, g in pending)
+    results = {}
+
+    async with aiohttp.ClientSession() as session:
+        for league in leagues:
+            url = f"https://site.api.espn.com/apis/site/v2/sports/football/{league}/scoreboard"
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+                for event in data.get('events', []):
+                    eid = str(event.get('id'))
+                    status = event.get('status', {}).get('type', {})
+                    state = status.get('state')
+                    completed = status.get('completed', False)
+                    if not (completed or state == 'post'):
+                        continue
+
+                    comp = event.get('competitions', [{}])[0]
+                    competitors = comp.get('competitors', [])
+                    home = next((c for c in competitors if c.get('homeAway') == 'home'), None)
+                    away = next((c for c in competitors if c.get('homeAway') == 'away'), None)
+                    if not home or not away:
+                        continue
+
+                    try:
+                        home_score = int(home.get('score', '0'))
+                        away_score = int(away.get('score', '0'))
+                    except:
+                        continue
+
+                    if home_score == away_score:
+                        continue
+
+                    winner_side = 'home' if home_score > away_score else 'away'
+                    results[eid] = winner_side
+
+    for game_id, game in pending:
+        eid = str(game.get('espn_id'))
+        if eid in results:
+            await finalize_game(game_id, results[eid])
+
 @bot.event
 async def on_ready():
     print(f'{bot.user} is online and ready to take bets!')
@@ -78,8 +276,40 @@ async def on_ready():
         print(f'Synced {len(synced)} slash commands')
     except Exception as e:
         print(f'Failed to sync commands: {e}')
-    check_game_locks.start()
-    auto_fetch_games.start()
+    
+    # Start tasks only if not already running
+    if not check_game_locks.is_running():
+        check_game_locks.start()
+    if not auto_fetch_games.is_running():
+        auto_fetch_games.start()
+    if not check_game_results.is_running():
+        check_game_results.start()
+    if not cleanup_old_games.is_running():
+        cleanup_old_games.start()
+
+@tasks.loop(hours=24)
+async def cleanup_old_games():
+    """Delete games older than 7 days from betting_data.json"""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=7)
+    
+    games_to_delete = []
+    for game_id, game in betting.games.items():
+        try:
+            game_time = datetime.fromisoformat(game['start_time'])
+            if game_time < cutoff:
+                games_to_delete.append(game_id)
+        except:
+            continue
+    
+    for game_id in games_to_delete:
+        del betting.games[game_id]
+        if game_id in betting.bets:
+            del betting.bets[game_id]
+    
+    if games_to_delete:
+        betting.save_data()
+        print(f"Cleaned up {len(games_to_delete)} old games")
 
 @tasks.loop(minutes=1)
 async def check_game_locks():
@@ -135,8 +365,8 @@ async def process_games(events, sport):
             game_time = datetime.fromisoformat(event['date'].replace('Z', '+00:00'))
             time_until_game = (game_time - datetime.now(timezone.utc)).total_seconds()
             
-            # Only post games starting within 6 hours, but at least 5 minutes out
-            if time_until_game < 300 or time_until_game > 21600:
+            # Only post games starting within 48 hours, but at least 5 minutes out
+            if time_until_game < 300 or time_until_game > 172800:
                 continue
             
             home_team = event['competitions'][0]['competitors'][0]['team']['abbreviation']
@@ -195,7 +425,9 @@ async def process_games(events, sport):
                 'locked': False,
                 'result': None,
                 'channel_id': channel_id,
-                'sport': sport
+                'sport': sport,
+                'espn_id': str(event.get('id')),
+                'league': 'nfl' if sport == 'NFL' else 'college-football'
             }
             betting.bets[game_id] = []
             betting.save_data()
@@ -247,7 +479,11 @@ async def process_games(events, sport):
             view = BettingView(game_id, betting.games[game_id])
             role_id = betting.config.get('bettor_role_id')
             content = f"<@&{role_id}>" if role_id else None
-            await channel.send(content=content, embed=embed, view=view)
+            message = await channel.send(content=content, embed=embed, view=view)
+            
+            # Store message ID for later editing
+            betting.games[game_id]['message_id'] = message.id
+            betting.save_data()
         except Exception as e:
             print(f"Error processing game: {e}")
 
@@ -493,9 +729,7 @@ class BetModal(discord.ui.Modal, title="Place Your Bet"):
             if 'insurance' in used_items:
                 items_text += "🛡️ Insurance activated!\n"
             embed.add_field(name="🎁 Items Used", value=items_text, inline=False)
-        embed.add_field(name="💵 Wagered", value=f"${bet_amount:,}", inline=True)
-        embed.add_field(name="💰 Potential Win", value=f"${potential_win:,.2f}", inline=True)
-        embed.add_field(name="📊 Odds", value=f"{odds:+.0f}", inline=True)
+        
         embed.set_footer(text=f"New Balance: ${betting.users[user_id]['balance']:,}")
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -553,7 +787,7 @@ class BettingView(discord.ui.View):
         await interaction.response.send_modal(modal)
     
     async def view_bets_callback(self, interaction: discord.Interaction):
-        game_id = interaction.message.embeds[0].footer.text.replace("Game ID: ", "")
+        game_id = interaction.message.embeds[0].footer.text.replace("Game ID: ", "").split(" •")[0]
         game = betting.games.get(game_id)
         if not game:
             await interaction.response.send_message("❌ Game not found!", ephemeral=True)
@@ -564,13 +798,58 @@ class BettingView(discord.ui.View):
             await interaction.response.send_message("📭 No bets placed yet!", ephemeral=True)
             return
         
+        async def get_user_display(uid: str):
+            try:
+                if interaction.guild:
+                    m = interaction.guild.get_member(int(uid))
+                    if m:
+                        return m.mention
+                u = await bot.fetch_user(int(uid))
+                return u.mention
+            except:
+                return f"User {uid}"
+        
         home_bets = [b for b in bets_list if b['team'] == 'home']
         away_bets = [b for b in bets_list if b['team'] == 'away']
         
+        async def build_lines(bets):
+            lines = []
+            for b in sorted(bets, key=lambda x: x.get('amount', 0), reverse=True):
+                who = await get_user_display(b['user_id'])
+                lines.append(f"{who} — ${b['amount']:,} @ {b['odds']:+.0f}")
+            return lines
+        
+        def chunk_lines(lines, limit=1024):
+            chunks = []
+            cur = ""
+            for line in lines:
+                add = (line + "\n")
+                if len(cur) + len(add) > limit:
+                    if cur:
+                        chunks.append(cur.rstrip())
+                    cur = add
+                else:
+                    cur += add
+            if cur:
+                chunks.append(cur.rstrip())
+            return chunks
+        
+        home_lines = await build_lines(home_bets)
+        away_lines = await build_lines(away_bets)
+        
         embed = discord.Embed(title="📊 Current Bets", color=0x9b59b6)
-        embed.add_field(name=f"{game['home_team']}", value=f"{len(home_bets)} bet(s)", inline=True)
-        embed.add_field(name=f"{game['away_team']}", value=f"{len(away_bets)} bet(s)", inline=True)
-        embed.add_field(name="💰 Total Action", value=f"${sum(b['amount'] for b in bets_list):,}", inline=True)
+        embed.add_field(name="💰 Total Action", value=f"${sum(b['amount'] for b in bets_list):,}", inline=False)
+        
+        home_chunks = chunk_lines(home_lines) if home_lines else ["None"]
+        away_chunks = chunk_lines(away_lines) if away_lines else ["None"]
+        
+        embed.add_field(name=f"{game['home_team']} ({len(home_bets)} bet(s))", value=home_chunks[0], inline=False)
+        for i, ch in enumerate(home_chunks[1:], 2):
+            embed.add_field(name=f"{game['home_team']} (cont. {i})", value=ch, inline=False)
+        
+        embed.add_field(name=f"{game['away_team']} ({len(away_bets)} bet(s))", value=away_chunks[0], inline=False)
+        for i, ch in enumerate(away_chunks[1:], 2):
+            embed.add_field(name=f"{game['away_team']} (cont. {i})", value=ch, inline=False)
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -713,21 +992,21 @@ async def slots(ctx, amount: int):
     
     import random
     emojis = ['🍒', '🍋', '🍊', '🍇', '💎', '7️⃣']
-    weights = [30, 25, 20, 15, 7, 3]  # 💎 and 7️⃣ are rare
+    weights = [22, 22, 22, 22, 10, 2]  # Balanced odds, rare symbols stay rare
     
     slots = random.choices(emojis, weights=weights, k=3)
     
-    # Calculate winnings
+    # Calculate winnings - slightly in gambler's favor
     if slots[0] == slots[1] == slots[2]:
         if slots[0] == '7️⃣':
-            multiplier = 10  # Jackpot!
+            multiplier = 100  # Rare but HUGE jackpot
         elif slots[0] == '💎':
-            multiplier = 5
+            multiplier = 20  # Big win
         else:
-            multiplier = 3
+            multiplier = 4  # Solid win
         winnings = amount * multiplier
-    elif slots[0] == slots[1] or slots[1] == slots[2]:
-        multiplier = 1.5
+    elif slots[0] == slots[1] or slots[1] == slots[2] or slots[0] == slots[2]:  # Any two matching
+        multiplier = 1.8  # Small profit on two matches
         winnings = int(amount * multiplier)
     else:
         winnings = 0
@@ -854,6 +1133,10 @@ async def mybets(ctx):
     active_bets = []
     
     for game_id, bets in betting.bets.items():
+        # Skip if game was deleted
+        if game_id not in betting.games:
+            continue
+            
         user_bet = next((b for b in bets if b['user_id'] == user_id), None)
         if user_bet and not betting.games[game_id].get('result'):
             game = betting.games[game_id]
@@ -1101,6 +1384,10 @@ async def slash_mybets(interaction: discord.Interaction):
     active_bets = []
     
     for game_id, bets in betting.bets.items():
+        # Skip if game was deleted
+        if game_id not in betting.games:
+            continue
+            
         user_bet = next((b for b in bets if b['user_id'] == user_id), None)
         if user_bet and not betting.games[game_id].get('result'):
             game = betting.games[game_id]
@@ -1808,26 +2095,26 @@ async def slash_slots(interaction: discord.Interaction, amount: int):
     
     betting.update_balance(user_id, -amount)
     
-    # Slot symbols
+    # Slot symbols - slightly favoring player
     symbols = ['🍒', '🍋', '🍊', '🍇', '💎', '7️⃣']
-    weights = [30, 25, 20, 15, 8, 2]  # Rarity weights
+    weights = [22, 22, 22, 22, 10, 2]  # Balanced odds, rare symbols stay rare
     
     import random
     slot1 = random.choices(symbols, weights=weights)[0]
     slot2 = random.choices(symbols, weights=weights)[0]
     slot3 = random.choices(symbols, weights=weights)[0]
     
-    # Calculate winnings
+    # Calculate winnings - slightly in gambler's favor
     winnings = 0
     if slot1 == slot2 == slot3:
         if slot1 == '7️⃣':
-            winnings = amount * 10  # Jackpot!
+            winnings = amount * 100  # Rare but HUGE jackpot
         elif slot1 == '💎':
-            winnings = amount * 5
+            winnings = amount * 20  # Big win
         else:
-            winnings = amount * 3
-    elif slot1 == slot2 or slot2 == slot3:
-        winnings = amount * 2
+            winnings = amount * 4  # Solid win
+    elif slot1 == slot2 or slot2 == slot3 or slot1 == slot3:  # Any two matching
+        winnings = int(amount * 1.8)  # Small profit on two matches
     
     if winnings > 0:
         betting.update_balance(user_id, winnings)
